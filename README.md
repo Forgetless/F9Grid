@@ -6,6 +6,12 @@ A truly GPS drift-resistant geographic grid system — with drift ≤11.8m, repe
 
 [中文文档](README_zh.md)
 
+<p align="center">
+  <img src="Assets/F9Grid.jpg" width="600" alt="F9Grid Overview"/>
+</p>
+
+<p align="center"><em>Near-square cells with identical shape at each latitude. Each cell divided into 9 position codes for GPS drift correction.</em></p>
+
 ## Overview
 
 F9Grid is a grid system developed and extended based on PlusCode's 10-digit code grid. It extends PlusCode by appropriately merging high-latitude grids along the longitude direction while keeping cells at the same latitude the same size, aiming to make the cell area close to the standard cell area.
