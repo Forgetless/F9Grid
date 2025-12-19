@@ -153,6 +153,102 @@ public struct F9Grid {
             hasher.combine(index)
         }
 
+        // MARK: - Direction Enum
+
+        /// Direction for neighbor lookup
+        public enum Direction: CaseIterable {
+            case n, s, e, w, ne, nw, se, sw
+        }
+
+        // MARK: - Neighbor Methods
+
+        /// Get neighbor cell in the specified direction
+        /// - Parameter direction: The direction to look for neighbor
+        /// - Returns: The neighbor F9Cell, or nil if at pole boundary
+        public func neighbor(_ direction: Direction) -> F9Cell? {
+            // Poles have no neighbors in traditional sense
+            if isPole { return nil }
+
+            switch direction {
+            case .e:
+                return F9Grid.cell(index: F9Grid.getEastNeighbor(index: index))
+            case .w:
+                return F9Grid.cell(index: F9Grid.getWestNeighbor(index: index))
+            case .n:
+                return F9Grid.findNorthNeighbor(for: self)
+            case .s:
+                return F9Grid.findSouthNeighbor(for: self)
+            case .ne:
+                guard let north = neighbor(.n) else { return nil }
+                return north.neighbor(.e)
+            case .nw:
+                guard let north = neighbor(.n) else { return nil }
+                return north.neighbor(.w)
+            case .se:
+                guard let south = neighbor(.s) else { return nil }
+                return south.neighbor(.e)
+            case .sw:
+                guard let south = neighbor(.s) else { return nil }
+                return south.neighbor(.w)
+            }
+        }
+
+        /// Get all 8 neighbors (N, NE, E, SE, S, SW, W, NW)
+        /// - Returns: Dictionary of direction to neighbor cell (excludes nil neighbors at poles)
+        public func neighbors() -> [Direction: F9Cell] {
+            var result: [Direction: F9Cell] = [:]
+            for direction in Direction.allCases {
+                if let neighbor = neighbor(direction) {
+                    result[direction] = neighbor
+                }
+            }
+            return result
+        }
+
+        // MARK: - Sub-cell Bounds
+
+        /// Get the geographic bounds for a sub-cell (9-grid position)
+        /// - Parameter positionCode: Position code (1-9)
+        /// - Returns: Tuple with latitude and longitude ranges, or nil for poles or invalid code
+        public func subCellBounds(positionCode: Int) -> (latRange: (south: Double, north: Double), lngRange: (west: Double, east: Double))? {
+            guard (1...9).contains(positionCode), !isPole else { return nil }
+
+            // Find row and col from position code
+            // positionCodeInCell[row][col] = code
+            var positionRow = 0
+            var positionCol = 0
+            outer: for row in 0..<3 {
+                for col in 0..<3 {
+                    if F9Grid.positionCodeInCell[row][col] == positionCode {
+                        positionRow = row
+                        positionCol = col
+                        break outer
+                    }
+                }
+            }
+
+            let scale = Decimal(F9Grid.scale)
+            let baseUnit = Decimal(1) / scale  // 0.000125°
+
+            // Latitude: each cell is 3 base units high, divided into 3 rows
+            let latSouth = latRangeDecimal.south + Decimal(positionRow) * baseUnit
+            let latNorth = latSouth + baseUnit
+
+            // Longitude: each cell is k base units wide, divided into 3 columns
+            let kDecimal = Decimal(k)
+            let cellWidth = kDecimal / scale
+            let colWidth = cellWidth / Decimal(3)
+            let lngWest = lngRangeDecimal.west + Decimal(positionCol) * colWidth
+            let lngEast = lngWest + colWidth
+
+            return (
+                latRange: (NSDecimalNumber(decimal: latSouth).doubleValue,
+                          NSDecimalNumber(decimal: latNorth).doubleValue),
+                lngRange: (NSDecimalNumber(decimal: lngWest).doubleValue,
+                          NSDecimalNumber(decimal: lngEast).doubleValue)
+            )
+        }
+
         /// Calculate position code for given coordinates within this cell
         /// - Parameters:
         ///   - lat: Latitude as Decimal
@@ -544,6 +640,202 @@ public struct F9Grid {
         )
     }
 
+    // MARK: - Band Info
+
+    /// Band information for a specific latitude
+    public struct BandInfo {
+        public let k: Int
+        public let northBoundary: Double
+        public let southBoundary: Double
+        public let cellsInRow: Int64
+    }
+
+    /// Get band information for a given latitude
+    /// - Parameter lat: Latitude as Decimal
+    /// - Returns: BandInfo containing k value and latitude boundaries, or nil for poles
+    public static func bandInfo(forLatitude lat: Decimal) -> BandInfo? {
+        let gridLat = decimalToGrid(lat)
+
+        // Check for pole regions
+        if gridLat >= gridNorthPoleBoundary || gridLat < gridSouthPoleBoundary {
+            return nil  // Poles don't have standard band info
+        }
+
+        let step = latToStep(gridLat)
+        guard let band = getBandByStep(step) else { return nil }
+
+        let (gridLatNorth, gridLatSouth) = stepToGridLatRange(step)
+        let scaleDouble = Double(scale)
+
+        return BandInfo(
+            k: band.k,
+            northBoundary: Double(gridLatNorth) / scaleDouble,
+            southBoundary: Double(gridLatSouth) / scaleDouble,
+            cellsInRow: band.cellsInRow
+        )
+    }
+
+    /// Get band information for a given latitude (Double convenience)
+    public static func bandInfo(forLatitude lat: Double) -> BandInfo? {
+        return bandInfo(forLatitude: Decimal(lat))
+    }
+
+    // MARK: - Cells in Rectangle
+
+    /// Find all cells within a geographic rectangle
+    /// - Parameters:
+    ///   - minLat: Minimum latitude (south boundary)
+    ///   - maxLat: Maximum latitude (north boundary)
+    ///   - minLng: Minimum longitude (west boundary)
+    ///   - maxLng: Maximum longitude (east boundary)
+    /// - Returns: Array of F9Cell within the rectangle
+    /// - Note: Includes cells that intersect with the rectangle boundaries
+    public static func cellsInRect(minLat: Decimal, maxLat: Decimal,
+                                   minLng: Decimal, maxLng: Decimal) -> [F9Cell] {
+        var result: [F9Cell] = []
+
+        // Clamp latitude to valid range
+        let clampedMinLat = max(minLat, Decimal(-90))
+        let clampedMaxLat = min(maxLat, Decimal(90))
+
+        guard clampedMinLat <= clampedMaxLat else { return result }
+
+        // Check for pole inclusion
+        let gridMinLat = decimalToGrid(clampedMinLat)
+        let gridMaxLat = decimalToGrid(clampedMaxLat)
+
+        // Include north pole if maxLat reaches it
+        if gridMaxLat >= gridNorthPoleBoundary {
+            result.append(northPoleCell)
+        }
+
+        // Include south pole if minLat reaches it
+        if gridMinLat < gridSouthPoleBoundary {
+            result.append(southPoleCell)
+        }
+
+        // Get step range for non-pole cells
+        let effectiveMinLat = max(gridMinLat, gridSouthPoleBoundary)
+        let effectiveMaxLat = min(gridMaxLat, gridNorthPoleBoundary - 1)
+
+        guard effectiveMinLat <= effectiveMaxLat else { return result }
+
+        // Calculate step range (note: higher lat = lower step number)
+        let minStep = latToStep(effectiveMaxLat)  // north boundary -> lower step
+        let maxStep = latToStep(effectiveMinLat)  // south boundary -> higher step
+
+        // Check if covering full longitude range (360° or more)
+        let lngSpan = maxLng - minLng
+        let fullLngCoverage = lngSpan >= 360
+
+        // Normalize longitude to [0, 360) for calculations
+        var normMinLng = minLng
+        var normMaxLng = maxLng
+        while normMinLng < 0 { normMinLng += 360 }
+        while normMinLng >= 360 { normMinLng -= 360 }
+        while normMaxLng < 0 { normMaxLng += 360 }
+        while normMaxLng >= 360 { normMaxLng -= 360 }
+
+        // Handle longitude wrap-around
+        let lngWraps = !fullLngCoverage && normMaxLng < normMinLng
+
+        // Iterate through each step (latitude row)
+        for step in minStep...maxStep {
+            guard let band = getBandByStep(step) else { continue }
+
+            let k = band.k
+            let cellsInRow = band.cellsInRow
+            let scaleDecimal = Decimal(scale)
+            let kDecimal = Decimal(k)
+            let cellWidth = kDecimal / scaleDecimal
+
+            // Calculate longitude index range
+            let gridMinLngIdx = Int64(floor(NSDecimalNumber(decimal: normMinLng / cellWidth).doubleValue))
+            let gridMaxLngIdx = Int64(floor(NSDecimalNumber(decimal: normMaxLng / cellWidth).doubleValue))
+
+            // Get the row's starting index
+            let rowStartIndex = band.indexStart + Int64(step - band.stepStart) * cellsInRow
+
+            if fullLngCoverage {
+                // Full longitude coverage: include all cells in this row
+                for lngIdx in Int64(0)..<cellsInRow {
+                    let cellIndex = rowStartIndex + lngIdx
+                    if let c = cell(index: cellIndex) {
+                        result.append(c)
+                    }
+                }
+            } else if lngWraps {
+                // Longitude wraps around: include [normMinLng, 360) and [0, normMaxLng]
+                // From normMinLng to end of row
+                for lngIdx in gridMinLngIdx..<cellsInRow {
+                    let cellIndex = rowStartIndex + lngIdx
+                    if let c = cell(index: cellIndex) {
+                        result.append(c)
+                    }
+                }
+                // From start of row to normMaxLng
+                for lngIdx in Int64(0)...gridMaxLngIdx {
+                    let cellIndex = rowStartIndex + lngIdx
+                    if let c = cell(index: cellIndex) {
+                        result.append(c)
+                    }
+                }
+            } else {
+                // Normal case: include [normMinLng, normMaxLng]
+                for lngIdx in gridMinLngIdx...gridMaxLngIdx {
+                    let wrappedLngIdx = ((lngIdx % cellsInRow) + cellsInRow) % cellsInRow
+                    let cellIndex = rowStartIndex + wrappedLngIdx
+                    if let c = cell(index: cellIndex) {
+                        result.append(c)
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Find all cells within a geographic rectangle (Double convenience)
+    public static func cellsInRect(minLat: Double, maxLat: Double,
+                                   minLng: Double, maxLng: Double) -> [F9Cell] {
+        return cellsInRect(minLat: Decimal(minLat), maxLat: Decimal(maxLat),
+                          minLng: Decimal(minLng), maxLng: Decimal(maxLng))
+    }
+
+    // MARK: - Neighbor Helpers (Internal)
+
+    /// Find north neighbor cell
+    internal static func findNorthNeighbor(for currentCell: F9Cell) -> F9Cell? {
+        // Move to north cell using center longitude
+        let northLat = currentCell.latRangeDecimal.north + oneGridUnit
+        let gridNorthLat = decimalToGrid(northLat)
+
+        // Check if entering north pole
+        if gridNorthLat >= gridNorthPoleBoundary {
+            return northPoleCell
+        }
+
+        // Use center longitude to find north neighbor
+        let centerLng = (currentCell.lngRangeDecimal.west + currentCell.lngRangeDecimal.east) / 2
+        return cell(lat: northLat, lng: centerLng)
+    }
+
+    /// Find south neighbor cell
+    internal static func findSouthNeighbor(for currentCell: F9Cell) -> F9Cell? {
+        // Move to south cell using center longitude
+        let southLat = currentCell.latRangeDecimal.south - oneGridUnit
+        let gridSouthLat = decimalToGrid(southLat)
+
+        // Check if entering south pole
+        if gridSouthLat < gridSouthPoleBoundary {
+            return southPoleCell
+        }
+
+        // Use center longitude to find south neighbor
+        let centerLng = (currentCell.lngRangeDecimal.west + currentCell.lngRangeDecimal.east) / 2
+        return cell(lat: southLat, lng: centerLng)
+    }
+
     // MARK: - Drift Correction (findOriginalCell implementation)
 
     /// Internal implementation using Decimal coordinates for precise boundary comparisons
@@ -713,7 +1005,7 @@ public struct F9Grid {
     // Neighbor lookup
 
     /// Get east neighbor index (wraps around at row end)
-    private static func getEastNeighbor(index: Int64) -> Int64 {
+    internal static func getEastNeighbor(index: Int64) -> Int64 {
         guard let band = getBandByIndex(index),
               let range = band.rowIndexRange(containing: index) else {
             return index + 1
@@ -722,7 +1014,7 @@ public struct F9Grid {
     }
 
     /// Get west neighbor index (wraps around at row start)
-    private static func getWestNeighbor(index: Int64) -> Int64 {
+    internal static func getWestNeighbor(index: Int64) -> Int64 {
         guard let band = getBandByIndex(index),
               let range = band.rowIndexRange(containing: index) else {
             return index - 1
